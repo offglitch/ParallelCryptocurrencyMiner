@@ -37,7 +37,7 @@
 // TODO ten nonces per task is fairly low. There is probably also a point where
 // increasing it too much will reduce performance. You will need to experiment
 // to find the optimal value.
-#define NONCES_PER_TASK 10
+#define NONCES_PER_TASK 100
 
 pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t task_staging = PTHREAD_COND_INITIALIZER;
@@ -81,34 +81,63 @@ void print_binary32(uint32_t num) {
     }
 }
 
-/* TODO documentation */
+ uint32_t set_difficulty(int diff){
+    uint32_t mask = 0;
+
+        printf("Mask now: ");
+        print_binary32(difficulty_mask);
+        printf("\n");
+
+    int i;
+    for(i = 0; i <32 - diff; ++i){ 
+        uint32_t position = 1 << i;
+        mask = mask | position;
+    }
+    return mask;
+
+ }
+
+/**
+ * Mine or do work related to finding the nonce.
+ *
+ */
 void *mine(void *arg) {
 
     struct thread_info *info = (struct thread_info *) arg;
     uint64_t *task_nonces = NULL;
 
+
     /* We'll keep on working until a solution for our bitcoin block is found */
-    while (true) {
+    while (! solution_found) {
+
 
         while (task_pointer == NULL && solution_found == false) {
-            /* We will busy wait here until task_pointer is not NULL. */
+             /* conditionally wait until the produce first the task ready signal
+              * That means we have a bunch of nonces ready for us to work on
+              */
         }
 
         if (solution_found) {
             /* Another thread has found the solution. This thread can exit. */
-            return NULL;
+
+            break;
         }
 
+        pthread_mutex_lock(&task_mutex);
         task_nonces = task_pointer;
 
         /* We have the task. Empty out our task_pointer so another thread can
          * receive a task. */
         task_pointer = NULL;
 
+        pthread_cond_signal(&task_staging);
+        pthread_mutex_unlock(&task_mutex);
+
         int i;
-        for (i = 0; i < NONCES_PER_TASK; ++i) {
+        for (i = 0; i < NONCES_PER_TASK && task_nonces != NULL ; ++i) {
             /* Convert the nonce to a string */
             char buf[21];
+
             sprintf(buf, "%llu", task_nonces[i]);
 
             /* Create a new string by concatenating the block and nonce string.
@@ -141,7 +170,8 @@ void *mine(void *arg) {
                 solution_found = true;
                 info->nonce = task_nonces[i];
                 sha1tostring(info->solution_hash, digest);
-                return NULL;
+
+                break;
             }
         }
 
@@ -149,6 +179,10 @@ void *mine(void *arg) {
         info->num_inversions += NONCES_PER_TASK;
     }
 
+    pthread_mutex_lock(&task_mutex);
+    pthread_cond_broadcast(&task_staging);
+    pthread_cond_broadcast(&task_ready);
+    pthread_mutex_unlock(&task_mutex);
     return NULL;
 }
 
@@ -159,10 +193,10 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // TODO we have hard coded the difficulty to 20 bits (0x0000FFF). This is a
-    // fairly quick computation -- something like 28 will take much longer.  You
-    // should allow the user to specify anywhere between 1 and 32 bits of zeros.
-    difficulty_mask = 0x000000FF;
+    /*
+     * Get the difficulty from the command line arguments.
+     */
+    difficulty_mask = set_difficulty(atoi(argv[2]));
     printf("Difficulty Mask: ");
     print_binary32(difficulty_mask);
     printf("\n");
@@ -171,8 +205,13 @@ int main(int argc, char *argv[]) {
      * complete bitcoin miner implementation, the block data would be composed
      * of bitcoin transactions. */
     bitcoin_block_data = argv[3];
-    // TODO we should probably check to make sure the user entered a valid
-    // (non-empty) string...
+
+    /*
+     * check to make sure that the user entered a valid string.
+     */
+    if (strlen(argv[3]) == 0){
+        printf("please enter a valid string");
+    }
 
     // TODO we have hard-coded the number of threads here because the
     // single-threaded version of the program can only run with one worker
@@ -180,11 +219,15 @@ int main(int argc, char *argv[]) {
     // the user and store them in an array. The thread_info struct contains a
     // pthread_t handle that we will use later to join the threads. Each struct
     // is passed in as the thread routine's argument.
-    unsigned int num_threads = 1;
+    unsigned int num_threads = atoi(argv[1]);
     printf("Number of threads: %d\n", num_threads);
-    struct thread_info *thread = calloc(1, sizeof(struct thread_info));
-    thread->thread_id = 0;
-    pthread_create(&thread->thread_handle, NULL, mine, thread);
+    struct thread_info *thread = calloc(num_threads, sizeof(struct thread_info));
+
+    for(int i = 0 ; i < num_threads ; i++) {
+        thread[i].thread_id = i + 1;
+        pthread_create(& thread[i].thread_handle, NULL, mine, &thread[i]);
+    }
+
 
     double start_time = get_time();
     uint64_t current_nonce = 0;
@@ -206,12 +249,13 @@ int main(int argc, char *argv[]) {
         /* Nonces are ready to be consumed. We will wait for a consumer thread
          * to pick up the job. */
         pthread_mutex_lock(&task_mutex);
-        while (task_pointer != NULL && solution_found == false) {
+        if (task_pointer != NULL && solution_found == false) {
             /* When task_pointer is not NULL, the task has not been picked up by
              * a consumer yet. We will wait until a consumer is ready. */
+
             // TODO we are just busy waiting here. In your multi-threaded
             // version of the program, you should wait on a condition variable.
-            //pthread_cond_wait(&task_staging, &task_mutex);
+            pthread_cond_wait(&task_staging, &task_mutex);
         }
 
         if (solution_found == true) {
@@ -236,19 +280,23 @@ int main(int argc, char *argv[]) {
      * signal any waiting worker threads so they will wake up and see that we
      * are done. */
     pthread_cond_broadcast(&task_ready);
+  //  pthread_cond_broadcast(&task_staging);
     pthread_mutex_unlock(&task_mutex);
 
     double end_time = get_time();
     uint64_t total_inversions = 0;
     // TODO we should join on all the threads here and add up the total number
     // of hashes computed.
-    pthread_join(thread->thread_handle, NULL);
-    if (strlen(thread->solution_hash) > 0) {
-        printf("Solution found by thread %d:\n", thread->thread_id);
-        printf("Nonce: %llu\n", thread->nonce);
-        printf("Hash: %s\n", thread->solution_hash);
+
+    for(int i = 0 ; i < num_threads ; i ++) {
+        pthread_join(thread[i].thread_handle, NULL);
+        if (strlen(thread[i].solution_hash) > 0) {
+            printf("Solution found by thread %d:\n", thread[i].thread_id);
+            printf("Nonce: %llu\n", thread[i].nonce);
+            printf("Hash: %s\n", thread[i].solution_hash);
+        }
+        total_inversions += thread[i].num_inversions;
     }
-    total_inversions += thread->num_inversions;
 
     double total_time = end_time - start_time;
     printf("%llu hashes in %.2fs (%.2f hashes/sec)\n",
@@ -256,3 +304,4 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+
